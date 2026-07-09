@@ -424,13 +424,17 @@ export const App: React.FC = () => {
     return '';
   };
 
-  // 从标题生成 URL 友好的 slug
+  // 从标题生成 URL 友好的 slug（保留中文、英文、数字）
   const makeSlug = (title: string): string => {
-    return title
+    const slug = title
       .toLowerCase()
       .replace(/[^a-z0-9\u4e00-\u9fff\-]+/g, '-')
+      .replace(/--+/g, '-')
       .replace(/^-|-$/g, '')
       .slice(0, 80) || `entry-${Date.now()}`;
+    // 纯数字 slug 会被 EmDash 拒绝（500），加前缀
+    if (/^\d+$/.test(slug)) return `p-${slug}`;
+    return slug;
   };
 
   const createPage = async (table: any, fields: any[], recordId: string, emdashFid: string): Promise<string> => {
@@ -439,116 +443,74 @@ export const App: React.FC = () => {
     const { data: fullData } = await assembleEmdashData(table, recordId, fid2em, true);
     if (!fullData.title) fullData.title = '未命名';
     console.log('[createPage] 映射字段:', JSON.stringify(Object.keys(fid2em)), '组装数据 keys:', JSON.stringify(Object.keys(fullData)));
-
     const apiUrl = `${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}`;
-    console.log('[createPage] API URL:', apiUrl);
-    console.log('[createPage] collection:', collectionRef.current, 'origin:', baseOriginRef.current);
 
-    // 构建 payload：EmDash POST 要求三个顶层字段 — data(内容)、slug(URL标识)、status(状态)
-    const makePayload = (data: Record<string, any>) => {
-      const safe: Record<string, any> = {};
-      for (const [k, v] of Object.entries(data)) {
-        if (v && typeof v === 'object' && !Array.isArray(v) && (v as any).type === 'doc') continue;
-        safe[k] = v;
-      }
-      return {
-        data: safe,
-        slug: makeSlug(safe.title || fullData.title || 'untitled'),
-        status: 'draft',
-      };
-    };
-
-    const doPost = async (label: string, payload: any): Promise<{ id?: string; status?: number; text?: string }> => {
-      const body = JSON.stringify(payload);
-      console.log(`[createPage] ${label} body 长度:`, body.length, 'bytes, keys:', JSON.stringify(Object.keys(payload)));
-      const resp = await fetch(apiUrl, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${tkIn}`, 'Content-Type': 'application/json' },
-        body,
-      });
-      const text = await resp.text().catch(() => '');
-      console.log(`[createPage] ${label} 响应:`, resp.status, text.slice(0, 500));
-      if (resp.status >= 200 && resp.status < 300) {
-        try {
-          const d = JSON.parse(text);
-          const paths = [d?.id, d?.data?.id, d?.data?.item?.id, d?.data?.item, d?.pageId];
-          let id = '';
-          for (const p of paths) { if (p) { id = String(p); break; } }
-          if (!id) {
-            const search = (obj: any): string => {
-              if (!obj || typeof obj !== 'object') return '';
-              if (obj.id && typeof obj.id === 'string' && obj.id.startsWith('01')) return obj.id;
-              for (const v of Object.values(obj)) { const r = search(v); if (r) return r; }
-              return '';
-            };
-            id = search(d);
-          }
-          if (id) { console.log('[createPage] 拿到 pageId:', id); return { id }; }
-        } catch { /* fall through */ }
-      }
-      return { status: resp.status, text };
-    };
-
-    // 带 slug 冲突重试的 POST 封装
-    const postWithSlugRetry = async (
-      label: string, payload: any, baseSlug: string, maxRetries = 5
-    ): Promise<string | null> => {
-      for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        if (attempt > 1) payload.slug = `${baseSlug}-${attempt}`;
-        const result = await doPost(`${label} (尝试${attempt})`, payload);
-        if (result.id) return result.id;
-        // 只有 409 SLUG_CONFLICT 才值得重试，其他错误直接放弃
-        if (result.status !== 409) break;
-        console.log(`[createPage] ${label} slug 冲突(${payload.slug}), 尝试 -${attempt+1}`);
-      }
-      return null;
-    };
-
-    // 策略1: 完整 payload（含 slug），自动重试 slug 冲突
-    let fullPayload = makePayload(fullData);
-    let baseSlug = fullPayload.slug;
-    let id = await postWithSlugRetry('策略1-完整', fullPayload, baseSlug);
-
-    // 策略2: 仅 title + slug，自动重试 slug 冲突
-    if (!id) {
-      id = await postWithSlugRetry('策略2-最小', {
-        data: { title: fullData.title },
-        slug: baseSlug,
-        status: 'draft',
-      }, baseSlug);
+    // 构建 payload，过滤掉 doc 类型字段
+    const safe: Record<string, any> = {};
+    for (const [k, v] of Object.entries(fullData)) {
+      if (v && typeof v === 'object' && !Array.isArray(v) && (v as any).type === 'doc') continue;
+      safe[k] = v;
     }
 
-    // 策略3: 随机 slug 兜底
-    if (!id) {
-      const randomSlug = `entry-${Date.now()}`;
-      id = await postWithSlugRetry('策略3-兜底', {
-        data: {},
-        slug: randomSlug,
-        status: 'draft',
-      }, '', 1); // 随机 slug 几乎不冲突，试一次即可
-    }
-
-    if (!id) {
-      throw new Error(`创建页面失败（3条策略均未成功），请查看控制台日志`);
-    }
-
-    // 创建成功后用 PUT 补全完整字段数据（如果策略2/3 成功但数据不全）
-    if (Object.keys(fullData).length > 1 || (fullData.title && Object.keys(fullData).length > 0)) {
-      try {
-        const fullPayload = makePayload(fullData);
-        delete (fullPayload as any).slug; // PUT 不需要 slug
-        const putResp = await fetch(`${apiUrl}/${id}`, {
-          method: 'PUT',
+    // POST 创建页面，遇到 SLUG_CONFLICT(409) 时追加时间戳后缀重试（最多3次）
+    let baseSlug = makeSlug(safe.title || 'untitled');
+    const body = JSON.stringify({ data: safe, slug: baseSlug, status: 'draft' });
+    console.log('[createPage] POST body 长度:', body.length, 'slug:', baseSlug);
+    let resp = await fetch(apiUrl, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${tkIn}`, 'Content-Type': 'application/json' },
+      body,
+    });
+    let text = await resp.text().catch(() => '');
+    console.log('[createPage] 响应:', resp.status, text.slice(0, 500));
+    // Slug 冲突时自动加后缀重试
+    if (resp.status === 409 && text.includes('SLUG_CONFLICT')) {
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const uniqSlug = `${baseSlug}-${Date.now()}-${attempt}`;
+        console.log(`[createPage] Slug 冲突，第 ${attempt} 次重试，新 slug:`, uniqSlug);
+        const retryBody = JSON.stringify({ data: safe, slug: uniqSlug, status: 'draft' });
+        resp = await fetch(apiUrl, {
+          method: 'POST',
           headers: { Authorization: `Bearer ${tkIn}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify(fullPayload),
+          body: retryBody,
         });
-        const putBody = await putResp.text().catch(() => '');
-        console.log('[createPage] PUT 补全响应:', putResp.status, putBody.slice(0, 300));
-        if (!putResp.ok) {
-          console.warn('[createPage] PUT 补全失败（页面已创建，字段需在 EmDash 后台添加）');
-        }
-      } catch (e) { console.warn('[createPage] PUT 补全网络错误:', e); }
+        text = await resp.text().catch(() => '');
+        console.log('[createPage] 重试响应:', resp.status, text.slice(0, 300));
+        if (resp.status !== 409) break;
+      }
     }
+    if (!resp.ok) throw new Error(`创建失败 HTTP ${resp.status}: ${text.slice(0, 200)}`);
+
+    // 提取 pageId
+    let id = '';
+    try {
+      const d = JSON.parse(text);
+      const paths = [d?.id, d?.data?.id, d?.data?.item?.id, d?.data?.item, d?.pageId];
+      for (const p of paths) { if (p) { id = String(p); break; } }
+      if (!id) {
+        const search = (obj: any): string => {
+          if (!obj || typeof obj !== 'object') return '';
+          if (obj.id && typeof obj.id === 'string' && obj.id.startsWith('01')) return obj.id;
+          for (const v of Object.values(obj)) { const r = search(v); if (r) return r; }
+          return '';
+        };
+        id = search(d);
+      }
+    } catch { /* fall through */ }
+    if (!id) throw new Error(`创建成功但无法提取 ID: ${text.slice(0, 200)}`);
+    console.log('[createPage] 拿到 pageId:', id);
+
+    // PUT 补全全量字段
+    try {
+      const putPayload = { ...payload };
+      delete (putPayload as any).slug;
+      const putResp = await fetch(`${apiUrl}/${id}`, {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${tkIn}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(putPayload),
+      });
+      if (!putResp.ok) console.warn('[createPage] PUT 补全响应非200:', putResp.status);
+    } catch (e) { console.warn('[createPage] PUT 补全错误:', e); }
 
     if (emdashFid) await table.setCellValue(emdashFid, recordId, id);
     return id;
@@ -574,52 +536,59 @@ export const App: React.FC = () => {
     return slugs;
   };
 
-  // ---- 按钮 A: 修改分类确认 ----
+  // ---- 按钮 A: 修改分类提交（提交整条记录到 EmDash，分类可选） ----
   const onConfirm = async () => {
-    if (!s3) { setErr('请完整选择三级分类'); return; }
     setConf(true); setErr(null);
     try {
-      // 动作1: 更新飞书分类字段
+      // 动作1: 把选择的分类写入飞书（未选分类则写空值）
       const { table, recordId } = await doUpdate();
 
-      // 提前加载映射表和业务表名（createPage 和后续 PUT 都需要完整映射）
+      // 加载映射表
       const curTableId = ((await (bitable.base as any).getSelection().catch(() => ({}))) as any).tableId || '';
       const bizName = (await bitable.base.getTableMetaList()).find((t: any) => t.id === curTableId)?.name || '';
       await loadMappingConfig(bizName);
       try { localStorage.removeItem('fid2emdash_v1'); } catch { /* ignore */ }
 
-      // 确保有 Emdash ID（映射已加载，createPage 可传完整字段）
       const fields = await table.getFieldMetaList();
       const emdashFid = getFieldId(fields, ...EMDASH_ID_NAMES);
+
+      // 获取或创建 EmDash 页面
       let pageId = readCell(emdashFid ? await table.getCellValue(emdashFid, recordId).catch(() => null) : null);
       if (!pageId) pageId = await createPage(table, fields, recordId, emdashFid);
 
-      // 提交分类 termIds（同步等待，失败时可见错误）
-      const termIds = resolveTermIds();
-      console.log('[修改分类提交] pageId:', pageId, 'termIds:', JSON.stringify(termIds));
-      const tr = await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}/${pageId}/terms/${taxonomyEncRef.current}`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${tkIn}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ termIds }),
-      });
-      const tb = await tr.text();
-      console.log('[修改分类提交] 分类响应:', tr.status, tb.slice(0, 300));
-      if (!tr.ok) throw new Error(`分类关联失败 HTTP ${tr.status}: ${tb.slice(0, 200)}`);
+      // 1. 关联分类（仅当已选择三级分类时才执行）
+      if (s3) {
+        const termIds = resolveTermIds();
+        console.log('[修改分类提交] pageId:', pageId, 'termIds:', JSON.stringify(termIds));
+        let tr = await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}/${pageId}/terms/${taxonomyEncRef.current}`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${tkIn}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ termIds }),
+        });
+        let tb = await tr.text();
+        console.log('[修改分类提交] 分类响应:', tr.status, tb.slice(0, 300));
+        if (tr.status === 404) {
+          console.log('[修改分类提交] 分类关联 404，重建页面...');
+          if (emdashFid) await table.setCellValue(emdashFid, recordId, '').catch(() => {});
+          pageId = await createPage(table, fields, recordId, emdashFid);
+          tr = await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}/${pageId}/terms/${taxonomyEncRef.current}`, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${tkIn}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ termIds }),
+          });
+          tb = await tr.text();
+          console.log('[修改分类提交] 分类重试响应:', tr.status, tb.slice(0, 300));
+        }
+        if (!tr.ok) throw new Error(`分类关联失败 HTTP ${tr.status}: ${tb.slice(0, 200)}`);
+      }
 
+      // 2. 组装全量数据并 PUT 更新
       const allFields = await table.getFieldMetaList();
-      // 映射已在上面加载，直接复用 bizName
-
-      console.log('[修改分类确认] 当前表:', bizName, 'tableId:', curTableId);
-      for (const f of allFields) console.log(`  ${f.id} = "${f.fieldName || f.name}"`);
-
       const fid2em = buildFidToEmdash(allFields);
-      console.log('[修改分类确认] 字段→EmDash 映射:', JSON.stringify(Object.fromEntries(Object.entries(fid2em).map(([fid, c]) => [fid, c.key]))));
-
       const { data: emdashData, titleOk } = await assembleEmdashData(table, recordId, fid2em, false);
       if (!titleOk && !emdashData.title) emdashData.title = '未命名';
-      console.log('[修改分类确认] PUT payload:', JSON.stringify({ data: emdashData }).slice(0, 1000));
 
-      // EmDash 对多选字段是追加而非覆盖，先清空再写入避免旧值残留
+      // 多选/单选字段先清空再写入（EmDash 对数组字段是追加而非覆盖）
       if (emdashData.duoxuan !== undefined) {
         await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}/${pageId}`, {
           method: 'PUT',
@@ -635,29 +604,28 @@ export const App: React.FC = () => {
         });
       }
 
-      const resp = await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}/${pageId}`, {
+      // PUT 更新全量数据，404 则重建重试
+      let resp = await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}/${pageId}`, {
         method: 'PUT',
         headers: { Authorization: `Bearer ${tkIn}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ data: emdashData }),
       });
-      // 如果 404（Emdash ID 来自其他表/已删除），清除旧 ID 并重建
       if (resp.status === 404) {
-        console.log('[修改分类提交] 产品 404，重建中...');
+        console.log('[修改分类提交] PUT 404，重建页面...');
         if (emdashFid) await table.setCellValue(emdashFid, recordId, '').catch(() => {});
         pageId = await createPage(table, fields, recordId, emdashFid);
-        // 重建后重新 PUT
-        const resp2 = await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}/${pageId}`, {
+        resp = await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}/${pageId}`, {
           method: 'PUT',
           headers: { Authorization: `Bearer ${tkIn}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ data: emdashData }),
         });
-        if (!resp2.ok) { const e = await resp2.text().catch(() => ''); throw new Error(`重建产品 HTTP ${resp2.status}: ${e.slice(0, 200)}`); }
-      } else if (!resp.ok) {
+      }
+      if (!resp.ok) {
         const e = await resp.text().catch(() => '');
         throw new Error(`提交完整记录 HTTP ${resp.status}: ${e.slice(0, 200)}`);
       }
 
-      // 发布页面（默认状态是 draft，Post 到 publish 端点改为 published）
+      // 3. 发布
       await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}/${pageId}/publish`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${tkIn}` },
@@ -730,7 +698,7 @@ export const App: React.FC = () => {
           }
         }
         // 2. 从 EmDash 获取所有产品 ID
-        const emdashResp = await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}?limit=500`, {
+        const emdashResp = await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}?limit=100`, {
           headers: { Authorization: `Bearer ${tkIn}` },
         });
         if (emdashResp.ok) {
@@ -754,12 +722,27 @@ export const App: React.FC = () => {
       } catch (e) { console.warn('[UU批量] 删除同步异常:', e); }
       // ========== 删除同步结束 ==========
 
-      for (let i = 0; i < uu.length; i++) {
-        const rid = uu[i];
+      // ========== 预校验：去重 + slug 健康度 ==========
+      const uniqueUu: string[] = [];
+      const seenRids = new Set<string>();
+      for (const rid of uu) {
+        if (seenRids.has(rid)) {
+          console.warn('[UU校验] ⚠️ 跳过重复 record_id:', rid.slice(0,8));
+        } else {
+          seenRids.add(rid);
+          uniqueUu.push(rid);
+        }
+      }
+      if (uniqueUu.length < uu.length) {
+        console.warn('[UU校验] 已去重', uu.length - uniqueUu.length, '条重复记录');
+      }
+      // ========== 校验结束 ==========
+
+      for (let i = 0; i < uniqueUu.length; i++) {
+        const rid = uniqueUu[i];
         try {
           let pageId = readCell(emdashFid ? await table.getCellValue(emdashFid, rid).catch(() => null) : null);
 
-          // 无 ID：调用 createPage 创建页面（内置三策略容错：完整字段→title+status→title）
           if (!pageId) {
             pageId = await createPage(table, fields, rid, emdashFid);
             console.log('[UU批量] 新建页面', pageId);
@@ -801,11 +784,23 @@ export const App: React.FC = () => {
               const ancs = tidx[catId].ancestors;
               if (Array.isArray(ancs)) for (const a of ancs) ids.push(String(a.id));
               ids.push(String(catId));
-              const tr = await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}/${pageId}/terms/${taxonomyEncRef.current}`, {
+              let tr = await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}/${pageId}/terms/${taxonomyEncRef.current}`, {
                 method: 'POST',
                 headers: { Authorization: `Bearer ${tkIn}`, 'Content-Type': 'application/json' },
                 body: JSON.stringify({ termIds: ids }),
               });
+              // 分类关联 404 恢复：内容项不存在则重建后重试
+              if (tr.status === 404) {
+                console.warn('[UU批量] 分类关联 404，清除旧 ID 重建');
+                if (emdashFid) await table.setCellValue(emdashFid, rid, '').catch(() => {});
+                pageId = await createPage(table, fields, rid, emdashFid);
+                // 用新 pageId 重试分类关联
+                tr = await fetch(`${baseOriginRef.current}/_emdash/api/content/${collectionRef.current}/${pageId}/terms/${taxonomyEncRef.current}`, {
+                  method: 'POST',
+                  headers: { Authorization: `Bearer ${tkIn}`, 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ termIds: ids }),
+                });
+              }
               console.log('[UU批量] 分类:', tr.ok ? 'OK' : `${tr.status}`);
             }
           } catch { /* 失败不阻断 */ }
